@@ -1,0 +1,175 @@
+name: Build macOS
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ 'ranroby76/supabase', main, master ]
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    env:
+      # secrets is NOT an available context in a step-level if:, nor in a
+      # workflow-level env:. Mirroring the certificate into a JOB-level env var
+      # is the only way to branch on "do we have signing material".
+      SIGNING_ENABLED: ${{ secrets.MACOS_CERTIFICATE }}
+      JUCE_TAG: 9.0.1
+      PRODUCT: Domina
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install ninja
+        run: brew install ninja
+
+      # ------------------------------------------------------------------
+      # Dependencies. Both are cloned rather than committed, so .gitignore
+      # must keep libs/ out of the repo - a committed libs/JUCE makes the
+      # clone fail with "destination path already exists".
+      # ------------------------------------------------------------------
+      - name: Clone JUCE ${{ env.JUCE_TAG }}
+        run: git clone --depth 1 --branch "$JUCE_TAG" https://github.com/juce-framework/JUCE.git libs/JUCE
+
+      - name: Clone clap-juce-extensions
+        run: |
+          git clone --recursive --depth 1 \
+            https://github.com/free-audio/clap-juce-extensions.git libs/CLAP_Extensions_CI
+          # the submodules are what the local ZIP download was missing
+          test -f libs/CLAP_Extensions_CI/clap-libs/clap/include/clap/version.h
+          test -f libs/CLAP_Extensions_CI/clap-libs/clap-helpers/include/clap/helpers/plugin.hh
+
+      # ------------------------------------------------------------------
+      # Pre-flight. This MUST mirror the CMakeLists' own path exactly or it
+      # reports fiction - that cost a wasted round trip on Grex.
+      # ------------------------------------------------------------------
+      - name: Check the logo is committed
+        run: |
+          if [ ! -f "assets/fanan_logo.png" ]; then
+            echo "::error::assets/fanan_logo.png is missing from the repo."
+            echo "CMake reads it as \${CMAKE_CURRENT_SOURCE_DIR}/assets/fanan_logo.png"
+            exit 1
+          fi
+          echo "logo: $(stat -f%z assets/fanan_logo.png) bytes"
+
+      - name: Import signing certificate
+        if: env.SIGNING_ENABLED != ''
+        env:
+          CERT: ${{ secrets.MACOS_CERTIFICATE }}
+          CERT_PW: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          echo "$CERT" | base64 --decode > cert.p12
+          security create-keychain -p ci build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p ci build.keychain
+          security import cert.p12 -k build.keychain -P "$CERT_PW" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k ci build.keychain
+          rm -f cert.p12
+          security find-identity -v -p codesigning build.keychain
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DJUCE_DIR="$PWD/libs/JUCE" \
+            -DCLAP_EXT_DIR="$PWD/libs/CLAP_Extensions_CI" \
+            -DDOMINA_TRACE=OFF \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      # ------------------------------------------------------------------
+      # Hard-fail rather than warn. A build that quietly produced nothing is
+      # worse than one that stopped.
+      # ------------------------------------------------------------------
+      - name: Verify the bundles
+        run: |
+          A="build/${PRODUCT}_artefacts/Release"
+          MISSING=0
+          for B in "VST3/${PRODUCT}.vst3" "AU/${PRODUCT}.component" "CLAP/${PRODUCT}.clap"; do
+            if [ -d "$A/$B" ]; then
+              echo "found $B"
+            else
+              echo "::error::missing $A/$B"
+              MISSING=1
+            fi
+          done
+          if [ "$MISSING" != "0" ]; then exit 1; fi
+
+          BIN="$A/VST3/${PRODUCT}.vst3/Contents/MacOS/${PRODUCT}"
+          lipo -info "$BIN"
+          if ! lipo -info "$BIN" | grep -q arm64;  then echo "::error::no arm64 slice";  exit 1; fi
+          if ! lipo -info "$BIN" | grep -q x86_64; then echo "::error::no x86_64 slice"; exit 1; fi
+
+      - name: Sign
+        if: env.SIGNING_ENABLED != ''
+        run: |
+          A="build/${PRODUCT}_artefacts/Release"
+          ID=$(security find-identity -v -p codesigning build.keychain \
+                 | grep "Developer ID Application" | head -1 \
+                 | sed -E 's/.*"(.*)"/\1/')
+          echo "signing as: $ID"
+          echo "SIGN_ID=$ID" >> "$GITHUB_ENV"
+
+          for B in "VST3/${PRODUCT}.vst3" "AU/${PRODUCT}.component" "CLAP/${PRODUCT}.clap"; do
+            # inside out: nested frameworks before the bundle that holds them
+            find "$A/$B" -name "*.framework" -type d -print0 \
+              | xargs -0 -I{} codesign --force --timestamp --options runtime -s "$ID" {} || true
+            codesign --force --deep --timestamp --options runtime -s "$ID" "$A/$B"
+            codesign --verify --deep --strict --verbose=2 "$A/$B"
+          done
+
+      - name: Notarize each bundle
+        if: env.SIGNING_ENABLED != ''
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 45
+          max_attempts: 3
+          retry_wait_seconds: 60
+          command: |
+            A="build/${PRODUCT}_artefacts/Release"
+            for B in "VST3/${PRODUCT}.vst3" "AU/${PRODUCT}.component" "CLAP/${PRODUCT}.clap"; do
+              NAME=$(basename "$B")
+              ditto -c -k --keepParent "$A/$B" "/tmp/$NAME.zip"
+              xcrun notarytool submit "/tmp/$NAME.zip" --wait \
+                --apple-id "${{ secrets.MACOS_NOTARIZATION_USERNAME }}" \
+                --password "${{ secrets.MACOS_NOTARIZATION_PASSWORD }}" \
+                --team-id  "${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}"
+              xcrun stapler staple "$A/$B"
+            done
+
+      - name: Build DMG
+        run: |
+          A="build/${PRODUCT}_artefacts/Release"
+          mkdir -p dmg
+          cp -R "$A/VST3/${PRODUCT}.vst3"      dmg/
+          cp -R "$A/AU/${PRODUCT}.component"   dmg/
+          cp -R "$A/CLAP/${PRODUCT}.clap"      dmg/
+          hdiutil create -volname "$PRODUCT" -srcfolder dmg -ov -format UDZO "${PRODUCT}.dmg"
+
+      - name: Sign, notarize and staple the DMG
+        if: env.SIGNING_ENABLED != ''
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 45
+          max_attempts: 3
+          retry_wait_seconds: 60
+          command: |
+            codesign --force --timestamp --options runtime -s "$SIGN_ID" "${PRODUCT}.dmg"
+            xcrun notarytool submit "${PRODUCT}.dmg" --wait \
+              --apple-id "${{ secrets.MACOS_NOTARIZATION_USERNAME }}" \
+              --password "${{ secrets.MACOS_NOTARIZATION_PASSWORD }}" \
+              --team-id  "${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}"
+            xcrun stapler staple "${PRODUCT}.dmg"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: Domina-macOS
+          path: ${{ env.PRODUCT }}.dmg
+          if-no-files-found: error

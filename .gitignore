@@ -1,0 +1,44 @@
+# ============================================================================
+#  C:\workspace\Domina\.gitignore
+# ============================================================================
+#
+#  libs/ and JUCE/ MUST stay ignored. The macOS workflow clones both itself,
+#  and a committed libs/JUCE makes `git clone ... libs/JUCE` fail outright with
+#  "destination path already exists and is not an empty directory".
+#
+#  Everything is root-anchored with a leading slash so nothing inside assets/
+#  is caught by accident.
+
+/build/
+/libs/
+/JUCE/
+/.vs/
+/out/
+/cmake-build-*/
+
+# runtime settings and diagnostics the plugin writes for itself
+Domina.settings
+Domina_trace.txt
+Domina_crash.txt
+
+# signing material - never commit any of this
+*.p12
+*.cer
+*.certSigningRequest
+mac_cert_base64
+entitlements.plist
+
+# build products
+*.dmg
+*.vst3
+*.component
+*.clap
+*.exe
+*.dll
+*.pdb
+
+# editor and OS noise
+.DS_Store
+Thumbs.db
+*.user
+*.suo
