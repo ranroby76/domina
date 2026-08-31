@@ -29,7 +29,7 @@ namespace
 DominaAudioProcessorEditor::DominaAudioProcessorEditor (DominaAudioProcessor& p)
     : AudioProcessorEditor (&p), proc (p), ribbon (p, lnf), seedDigits (p.apvts, lnf)
 {
-    DOMINA_LOG ("editor constructed");
+    DOMINA_LOG ("#" + juce::String (proc.traceId) + " editor constructed");
 
     setLookAndFeel (&lnf);
 
@@ -175,7 +175,11 @@ DominaAudioProcessorEditor::DominaAudioProcessorEditor (DominaAudioProcessor& p)
     holdAttach = std::make_unique<ButtonAttach> (proc.apvts, "arpHold", holdButton);
     addAndMakeVisible (holdButton);
 
-    panicButton.onClick = [this] { keyboard.allNotesOff(); };
+    panicButton.onClick = [this]
+    {
+        keyboard.allNotesOff();   // clear the on-screen keys
+        proc.requestPanic();      // and make the OUTPUT stop, whatever it thinks
+    };
     addAndMakeVisible (panicButton);
 
     logo = juce::ImageCache::getFromMemory (BinaryData::fanan_logo_png,
@@ -208,7 +212,7 @@ DominaAudioProcessorEditor::DominaAudioProcessorEditor (DominaAudioProcessor& p)
 
 DominaAudioProcessorEditor::~DominaAudioProcessorEditor()
 {
-    DOMINA_LOG ("editor destroyed");
+    DOMINA_LOG ("#" + juce::String (proc.traceId) + " editor destroyed");
 
     stopTimer();
 
@@ -417,6 +421,17 @@ void DominaAudioProcessorEditor::updateVelRandVisibility()
 void DominaAudioProcessorEditor::timerCallback()
 {
     applyPendingMidi();
+
+   #if DOMINA_TRACE
+    // Drained on the message thread; the audio thread only ever writes into the
+    // ring. Appended raw so the file is the exact order things happened in.
+    {
+        const auto notes = proc.drainNoteTrace();
+        if (notes.isNotEmpty())
+            DominaTrace::log (juce::String ("#") + juce::String (proc.traceId)
+                                + " notes:" + juce::newLine + notes);
+    }
+   #endif
 
     // An idiom written in another meter would be smeared across the bar, so the
     // core refuses to apply it. Showing that is better than leaving a button

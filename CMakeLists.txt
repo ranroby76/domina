@@ -110,9 +110,20 @@ juce_add_binary_data(DominaAssets SOURCES "${DOMINA_LOGO}")
 # nothing and turns a confusing link error into a non-event.
 set_target_properties(DominaAssets PROPERTIES POSITION_INDEPENDENT_CODE TRUE)
 
-# The lifecycle trace writes files at runtime, so it is OFF unless asked for.
-# Turn it on for a debugging session with -DDOMINA_TRACE=ON.
-option(DOMINA_TRACE "Write a lifecycle trace and crash log at runtime" OFF)
+# ON WHILE THE STUCK-NOTE BUG IS OPEN. Set this back to OFF before shipping.
+#
+# It was OFF and defaulting a diagnostic to off costs a round trip every time -
+# CMake caches options, so re-running the build alone does not pick up a -D
+# flag, and the trace file just stays empty with nothing saying why. The macOS
+# workflow passes -DDOMINA_TRACE=OFF explicitly, so release builds are clean
+# regardless of what this default says.
+option(DOMINA_TRACE "Write a lifecycle trace, note trace and crash log at runtime" ON)
+
+if(DOMINA_TRACE)
+    message(STATUS "Domina: RUNTIME TRACE IS ON -> %APPDATA%/Fanan/Domina_trace.txt")
+else()
+    message(STATUS "Domina: runtime trace off")
+endif()
 
 target_compile_definitions(Domina PUBLIC
     DOMINA_TRACE=$<BOOL:${DOMINA_TRACE}>

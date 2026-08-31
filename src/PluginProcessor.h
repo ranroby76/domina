@@ -33,6 +33,10 @@
 #include "MidiLearn.h"
 #include "SeededArpCore.h"
 
+// traceId below is initialised from DominaTrace::nextInstanceId(), so the
+// declaration has to be visible HERE, not only in the .cpp files.
+#include "DebugTrace.h"
+
 // clap-juce-extensions defines HAS_CLAP_JUCE_EXTENSIONS=1 on every target it is
 // linked into, so this needs no help from CMakeLists and stays 0 automatically
 // when CLAP is skipped. The VST3 compiles the same file, so everything below
@@ -149,11 +153,27 @@ private:
     // Hands the held chord between the arp and the direct pass-through when
     // MUTE ARP is toggled, so nothing is left sounding by the path it just left.
     void   handleArpMuteTransition (bool nowMuted, int atSample, double atBeat);
+
+    // Sends a note-off for everything Domina currently has sounding, by either
+    // path. The ONLY way to be certain nothing is stranded when the output
+    // changes hands.
+    void   silenceEverything (int atSample);
+    void   silenceBruteForce (int atSample);
+
+   public:
+    // PANIC from the editor. Queued for the audio thread rather than emitted
+    // there: MIDI must not be written from the message thread.
+    void   requestPanic() noexcept { panicPending.store (true, std::memory_order_relaxed); }
+   private:
+    std::atomic<bool> panicPending { false };
     int    sampleForBeat (double beat, int loSample, int hiSample) const;
     double beatAtSample (int sample) const;
 
-    void   emitNoteOn  (int sample, int note, float velocity);
-    void   emitNoteOff (int sample, int note);
+    // src tags WHICH path emitted this, purely for the diagnostic trace:
+    //   0 arp   1 pass-through   2 pending flush   3 silence-all
+    //   4 panic 5 mute re-arm
+    void   emitNoteOn  (int sample, int note, float velocity, int src = 0);
+    void   emitNoteOff (int sample, int note, int src = 0);
 
     double gatherBeatsForChordAt (int atSample, int numSamples, int gatherSamples) const;
 
@@ -193,6 +213,53 @@ private:
     // Audio thread only, so a plain Random is fine and no lock is needed.
     juce::Random velRng;
 
+   #if DOMINA_TRACE
+   public:
+    const int traceId = DominaTrace::nextInstanceId();
+   private:
+   #endif
+
+    // What Domina has actually told the world is sounding, maintained by
+    // emitNoteOn/emitNoteOff. Not the same as keyDown: the arp sounds notes
+    // nobody pressed, and the pass-through sounds the ones they did.
+    bool outSounding[128] {};
+
+   #if DOMINA_TRACE
+    // Every note Domina emits, captured on the audio thread into a lock-free
+    // ring and drained to the log by the editor's timer. A stuck note is an
+    // "on" with no matching "off", and this is the only way to SEE that rather
+    // than infer it from what it sounds like.
+    struct NoteEvent { int block; short sample; unsigned char note, on, src; };
+
+    static constexpr int kTraceSize = 8192;
+
+    NoteEvent        traceRing[kTraceSize] {};
+    std::atomic<int> traceHead { 0 };
+    int              traceTail = 0;
+    int              blockCounter = 0;
+    int              quietDrains  = 0;
+
+    void pushNoteTrace (int sample, int note, bool on, int src) noexcept;
+
+    // The block's clock, published every block for the trace. The note events
+    // showed the beat window frozen; these say WHICH value froze.
+    //
+    // SEPARATE atomics, not one atomic struct: a struct this size is not
+    // lock-free, so std::atomic<BlockState> would take a mutex on the audio
+    // thread. Individual doubles are lock-free on x64. The fields can be a
+    // block out of step with each other, which for a diagnostic is nothing.
+    std::atomic<double> stBlockStart { 0.0 }, stBlockBeats { 0.0 }, stBpm { 0.0 };
+    std::atomic<double> stLoopStart  { 0.0 }, stLoopEnd    { 0.0 };
+    std::atomic<double> stPlayPos    { 0.0 }, stHostPpq    { 0.0 };
+    std::atomic<int>    stPlaying    { 0 },   stSync       { 0 }, stSamples { 0 };
+
+   public:
+    // Message thread only. Returns "" when there is nothing new.
+    juce::String drainNoteTrace();
+    juce::String stateLine();
+   private:
+   #endif
+
     // MUTE ARP passes the played notes straight through instead of arpeggiating.
     // Flipping it has to hand the held chord from one path to the other, so the
     // previous state is remembered to catch the edge.
@@ -211,6 +278,11 @@ private:
     // transport genuinely standing still.
     double lastHostPpq     = 0.0;
     bool   haveHostPpq     = false;
+
+    // The furthest beat already turned into notes. Nothing may be rendered
+    // twice: see the monotonic guard in processBlock.
+    double lastRenderedBeat = 0.0;
+    bool   haveRendered     = false;
 
     // Samples elapsed since the arp last had anything sounding. Drives the
     // CONTINUOUS-off restart; counted in samples so it does not drift.

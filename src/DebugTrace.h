@@ -38,6 +38,16 @@ namespace DominaTrace
                  .getChildFile ("Domina_trace.txt");
     }
 
+    // Hosts keep more than one instance alive at a time - a scan, a second
+    // track, the same plugin in two formats - and without an id per instance
+    // the log reads as one confused timeline. Cheap, and it settles questions
+    // like "did that editor outlive its processor or belong to the other one".
+    inline int nextInstanceId()
+    {
+        static std::atomic<int> counter { 0 };
+        return ++counter;
+    }
+
     inline void log (const juce::String& what)
     {
         const auto f = traceFile();
@@ -67,7 +77,8 @@ namespace DominaTrace
                             + juce::SystemStats::getStackBacktrace() + juce::newLine);
         });
 
-        log ("--- trace started, Domina " JUCE_STRINGIFY (JucePlugin_VersionString) " ---");
+        log (juce::String ("--- trace started, Domina ") + JucePlugin_VersionString
+               + ", note trace ACTIVE, built " __DATE__ " " __TIME__ " ---");
     }
 
    #else

@@ -160,7 +160,7 @@ DominaAudioProcessor::DominaAudioProcessor()
       apvts (*this, nullptr, "PARAMS", createParameterLayout())
 {
     DominaTrace::installCrashHandler();
-    DOMINA_LOG ("processor constructed");
+    DOMINA_LOG ("#" + juce::String (traceId) + " processor constructed");
 
     pSeed       = apvts.getRawParameterValue ("arpSeed");
     pBars       = apvts.getRawParameterValue ("arpBars");
@@ -218,12 +218,12 @@ float DominaAudioProcessor::getSnapBeats() const
 // ---------------------------------------------------------------------------
 DominaAudioProcessor::~DominaAudioProcessor()
 {
-    DOMINA_LOG ("processor destroyed");
+    DOMINA_LOG ("#" + juce::String (traceId) + " processor destroyed");
 }
 
 void DominaAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
-    DOMINA_LOG ("prepareToPlay  rate=" + juce::String (sampleRate)
+    DOMINA_LOG ("#" + juce::String (traceId) + " prepareToPlay  rate=" + juce::String (sampleRate)
                   + "  block=" + juce::String (samplesPerBlock));
 
     curSampleRate = sampleRate;
@@ -246,8 +246,13 @@ void DominaAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock
     expectedNextPpq = -1.0e9;
     lastMuteArp     = -1;
     lastHold        = -1;
-    lastHostPpq     = 0.0;
-    haveHostPpq     = false;
+    lastHostPpq      = 0.0;
+    haveHostPpq      = false;
+    lastRenderedBeat = 0.0;
+    haveRendered     = false;
+
+    for (auto& s : outSounding)
+        s = false;
     idleSamples     = 0;
 
    #if DOMINA_CLAP
@@ -274,7 +279,7 @@ bool DominaAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) c
 
 void DominaAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
-    DOMINA_LOG ("getStateInformation");
+    DOMINA_LOG ("#" + juce::String (traceId) + " getStateInformation");
 
     auto state = apvts.copyState();
     state.setProperty ("midiLearn", midiLearn.toString(), nullptr);
@@ -285,7 +290,7 @@ void DominaAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 
 void DominaAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
-    DOMINA_LOG ("setStateInformation  bytes=" + juce::String (sizeInBytes));
+    DOMINA_LOG ("#" + juce::String (traceId) + " setStateInformation  bytes=" + juce::String (sizeInBytes));
 
     auto xml = getXmlFromBinary (data, sizeInBytes);
     if (xml == nullptr || ! xml->hasTagName (apvts.state.getType()))
@@ -298,7 +303,7 @@ void DominaAudioProcessor::setStateInformation (const void* data, int sizeInByte
 
 juce::AudioProcessorEditor* DominaAudioProcessor::createEditor()
 {
-    DOMINA_LOG ("createEditor");
+    DOMINA_LOG ("#" + juce::String (traceId) + " createEditor");
     return new DominaAudioProcessorEditor (*this);
 }
 
@@ -340,7 +345,7 @@ int DominaAudioProcessor::sampleForBeat (double beat, int loSample, int hiSample
 
 // Output channel and velocity scaling are applied at the point of emission, so
 // nothing upstream has to know about them.
-void DominaAudioProcessor::emitNoteOn (int sample, int note, float velocity)
+void DominaAudioProcessor::emitNoteOn (int sample, int note, float velocity, int src)
 {
     if (pMute->load() > 0.5f)
         return;
@@ -364,23 +369,173 @@ void DominaAudioProcessor::emitNoteOn (int sample, int note, float velocity)
     const float s = scale * 0.01f;
     const int v   = juce::jlimit (1, 127, juce::roundToInt (velocity * s * 127.0f));
 
+    // NEVER STACK A PITCH ON ITSELF. Whatever upstream decides to re-trigger a
+    // note already sounding, the instrument downstream must get a clean off
+    // first - two copies of one pitch a few milliseconds apart comb-filter, and
+    // that is heard as detuning rather than as a repeat.
+    const int safeNote = juce::jlimit (0, 127, note);
+
+    if (outSounding[safeNote])
+        outMidi.addEvent (juce::MidiMessage::noteOff (ch, safeNote), sample);
+
     outMidi.addEvent (juce::MidiMessage::noteOn (ch, note, (juce::uint8) v), sample);
+    outSounding[safeNote] = true;
+
+   #if DOMINA_TRACE
+    pushNoteTrace (sample, note, true, src);
+   #endif
 }
 
 // Note-offs are NOT muted: muting mid-phrase must not leave a note hanging in
 // whatever instrument is downstream.
-void DominaAudioProcessor::emitNoteOff (int sample, int note)
+void DominaAudioProcessor::emitNoteOff (int sample, int note, int src)
 {
     const int ch = juce::jlimit (1, 16, (int) pOutChannel->load());
     outMidi.addEvent (juce::MidiMessage::noteOff (ch, note), sample);
+    outSounding[juce::jlimit (0, 127, note)] = false;
+
+   #if DOMINA_TRACE
+    pushNoteTrace (sample, note, false, src);
+   #endif
 }
 
-// Handing the held chord between the arp and the direct path. Without this the
-// notes sounding at the moment of the flip are stranded: the arp stops emitting
-// their offs, or the pass-through never emitted their ons.
+#if DOMINA_TRACE
+void DominaAudioProcessor::pushNoteTrace (int sample, int note, bool on, int src) noexcept
+{
+    const int h = traceHead.load (std::memory_order_relaxed);
+
+    traceRing[h % kTraceSize] = { blockCounter,
+                                  (short) juce::jlimit (-1, 32000, sample),
+                                  (unsigned char) juce::jlimit (0, 127, note),
+                                  (unsigned char) (on ? 1 : 0),
+                                  (unsigned char) src };
+
+    traceHead.store (h + 1, std::memory_order_release);
+}
+
+juce::String DominaAudioProcessor::drainNoteTrace()
+{
+    const int head = traceHead.load (std::memory_order_acquire);
+
+    // A state line even when NOTHING played. Twelve seconds of silence looked
+    // like twelve seconds of missing log, which hid the bug rather than showing
+    // it - one line a second says "still alive, here is the clock, no notes".
+    if (head == traceTail)
+    {
+        if (++quietDrains < 20)
+            return {};
+
+        quietDrains = 0;
+        juce::String idle;
+        idle << "  (no notes)" << juce::newLine;
+        return idle + stateLine();
+    }
+
+    quietDrains = 0;
+
+    // If the audio thread lapped us, skip what was overwritten and say so.
+    juce::String out;
+    if (head - traceTail > kTraceSize)
+    {
+        out << "  [trace overflow, " << (head - traceTail - kTraceSize) << " lost]" << juce::newLine;
+        traceTail = head - kTraceSize;
+    }
+
+    static const char* srcName[] = { "arp", "thru", "pend", "hush", "panic", "rearm" };
+
+    while (traceTail < head)
+    {
+        const auto& e = traceRing[traceTail % kTraceSize];
+        out << "  blk " << e.block
+            << "  smp " << (int) e.sample
+            << (e.on ? "  ON  " : "  off ") << (int) e.note
+            << "  " << (e.src < 6 ? srcName[e.src] : "?")
+            << juce::newLine;
+        ++traceTail;
+    }
+
+    out << stateLine();
+    return out;
+}
+
+juce::String DominaAudioProcessor::stateLine()
+{
+    juce::String out;
+    const auto r = std::memory_order_relaxed;
+
+    int live = 0;
+    for (int n = 0; n < 128; ++n)
+        if (outSounding[n])
+            ++live;
+
+    out << "  -- sounding " << live
+        << "  start "  << juce::String (stBlockStart.load (r), 4)
+        << "  beats "  << juce::String (stBlockBeats.load (r), 6)
+        << "  bpm "    << juce::String (stBpm.load (r), 2)
+        << "  loop "   << juce::String (stLoopStart.load (r), 3)
+        << ".."        << juce::String (stLoopEnd.load (r), 3)
+        << "  pos "    << juce::String (stPlayPos.load (r), 3)
+        << "  ppq "    << juce::String (stHostPpq.load (r), 4)
+        << "  play "   << stPlaying.load (r)
+        << " sync "    << stSync.load (r)
+        << " smp "     << stSamples.load (r)
+        << juce::newLine;
+    return out;
+}
+#endif
+
+// BELT AND BRACES, deliberately.
+//
+// A stuck note IS our bookkeeping being wrong, so silencing that depends only
+// on the bookkeeping cannot be trusted to fix it. Three layers, cheapest first:
+//
+//   1. explicit note-offs for what we believe is sounding - targeted, and the
+//      only layer with no side effect on the instrument downstream
+//   2. CC 123 All Notes Off - reaches anything we have lost track of, though
+//      not every instrument implements it
+//   3. CC 120 All Sound Off - the forceful one, cuts releases too
+//
+// The full 0-127 sweep is NOT here. It belongs on an explicit panic, not on
+// every mute toggle: 128 note-offs per click is a lot of traffic and some
+// instruments stumble audibly on it.
+void DominaAudioProcessor::silenceEverything (int atSample)
+{
+    for (int n = 0; n < 128; ++n)
+        if (outSounding[n])
+            emitNoteOff (atSample, n, 3);
+
+    const int ch = juce::jlimit (1, 16, (int) pOutChannel->load());
+    outMidi.addEvent (juce::MidiMessage::allNotesOff (ch), atSample);
+    outMidi.addEvent (juce::MidiMessage::allSoundOff  (ch), atSample);
+}
+
+// The version that cannot be ignored: a note-off on every pitch, whatever
+// anyone believes is sounding. For PANIC and for an inbound all-notes-off,
+// where being heavy-handed is the whole point.
+void DominaAudioProcessor::silenceBruteForce (int atSample)
+{
+    silenceEverything (atSample);
+
+    const int ch = juce::jlimit (1, 16, (int) pOutChannel->load());
+
+    for (int n = 0; n < 128; ++n)
+        outMidi.addEvent (juce::MidiMessage::noteOff (ch, n), atSample);
+
+    for (auto& s : outSounding)
+        s = false;
+}
+
+// Handing the held chord between the arp and the direct path.
+//
+// SILENCE FIRST, ALWAYS. Flushing the arp's pending note-offs is not enough,
+// because it only knows about the arp's own notes. Un-muting used to leave the
+// PASS-THROUGH notes sounding with nothing left to ever turn them off - the arp
+// would then start playing on top of a chord that never released, which is the
+// legato drone. It has to be everything Domina has sounding, by either path.
 void DominaAudioProcessor::handleArpMuteTransition (bool nowMuted, int atSample, double atBeat)
 {
     flushAllPendingOffs (atSample);
+    silenceEverything (atSample);
     arp.reset();
     arp.params.chordGatherBeats = 0.0f;   // this chord is already fully known
 
@@ -390,7 +545,7 @@ void DominaAudioProcessor::handleArpMuteTransition (bool nowMuted, int atSample,
             continue;
 
         if (nowMuted)
-            emitNoteOn (atSample, n, keyVel[n]);
+            emitNoteOn (atSample, n, keyVel[n], 5);
         else
             arp.noteOn (n, keyVel[n], atBeat);
     }
@@ -399,7 +554,7 @@ void DominaAudioProcessor::handleArpMuteTransition (bool nowMuted, int atSample,
 void DominaAudioProcessor::flushAllPendingOffs (int atSample)
 {
     for (const auto& off : pendingOffs)
-        emitNoteOff (atSample, off.note);
+        emitNoteOff (atSample, off.note, 2);
 
     pendingOffs.clear();
 }
@@ -504,6 +659,10 @@ void DominaAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     const int numSamples = buffer.getNumSamples();
     buffer.clear();
 
+   #if DOMINA_TRACE
+    ++blockCounter;
+   #endif
+
     keyboardState.processNextMidiBuffer (midiMessages, 0, numSamples, true);
 
     // The host buffer is both input and output, so take a copy of the input and
@@ -512,6 +671,14 @@ void DominaAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     inMidi.addEvents (midiMessages, 0, numSamples, 0);
     midiMessages.clear();
     outMidi.clear();
+
+    if (panicPending.exchange (false, std::memory_order_relaxed))
+    {
+        for (int n = 0; n < 128; ++n) keyDown[n] = false;
+        arp.reset();
+        flushAllPendingOffs (0);
+        silenceBruteForce (0);
+    }
 
     refreshArpParams();
 
@@ -552,7 +719,13 @@ void DominaAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     arp.params.beatsPerBar = (float) juce::jmax (1.0, bpb);
     hostBeatsPerBar.store (arp.params.beatsPerBar, std::memory_order_relaxed);
     beatsPerSample         = bpm / 60.0 / curSampleRate;
-    const double blockBeats = beatsPerSample * numSamples;
+    // Sanity ceiling. If the host ever reports a wild tempo or an enormous
+    // block, an unbounded beat span makes the arp empty a whole pattern into a
+    // single buffer - the same audible failure by another route. Sixteen beats
+    // is far more than any real block.
+    const double blockBeats = juce::jlimit (0.0, 16.0, beatsPerSample * numSamples);
+
+    bool jumped = false;
 
     if (arp.rebakeIfNeeded())
         patternPub.publish (arp.getPattern());
@@ -574,36 +747,90 @@ void DominaAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         // split block we carry on from where the previous piece ended.
         const bool hostMoved = (! haveHostPpq) || std::abs (hostPpq - lastHostPpq) > 1.0e-9;
 
+        // TWO CLOCKS MUST NOT DRIVE ONE SPAN.
+        //
+        // This used to start every block at hostPpq and end it at hostPpq plus
+        // OUR OWN blockBeats. The host decided where the block began, we decided
+        // how far it ran. Whenever the host's position advanced by even slightly
+        // more or less than our estimate, consecutive blocks overlapped or left
+        // a gap - and an overlap emits the same notes a second time, with their
+        // note-offs landing on the wrong copies. That is the legato smear, and
+        // it can only happen here: free-running has no hostPpq, so one clock
+        // drives everything and the spans always meet exactly.
+        //
+        // So the host position is used to DETECT a jump, not to set the start.
+        // Between jumps the timeline is ours and is continuous by construction.
         if (hostMoved)
         {
             haveHostPpq = true;
             lastHostPpq = hostPpq;
 
-            // DAW loop, rewind or locate: drop stale note-offs and re-anchor, or
-            // the pattern carries on from the old anchor and lands on an
-            // arbitrary bar.
-            if (std::abs (hostPpq - expectedNextPpq) > 0.25)
+            // A real move: DAW loop, rewind, locate, or the very first block.
+            // Drop stale note-offs and re-anchor, or the pattern carries on from
+            // the old anchor and lands on an arbitrary bar.
+            if (! haveRendered || std::abs (hostPpq - expectedNextPpq) > 0.25)
             {
                 flushAllPendingOffs (0);
                 arp.reanchor (hostPpq);
-            }
+                jumped = true;
 
-            blockStartBeat = hostPpq;
+                blockStartBeat = hostPpq;      // snap, once
+            }
+            else
+            {
+                blockStartBeat = expectedNextPpq;   // carry on, do not snap
+            }
         }
         else
         {
             blockStartBeat = expectedNextPpq;
         }
-
-        expectedNextPpq = blockStartBeat + blockBeats;
-        freeBeat        = expectedNextPpq;
     }
     else
     {
-        blockStartBeat  = freeBeat;
-        freeBeat       += blockBeats;
-        expectedNextPpq = freeBeat;
+        blockStartBeat = freeBeat;
     }
+
+    // NOTHING IS EVER RENDERED TWICE.
+    //
+    // Around transport start and stop a host can report a position that repeats
+    // or steps slightly BACKWARDS - by less than the quarter beat the jump test
+    // looks for, so no re-anchor happens and the block simply overlaps the one
+    // before it. That slice of the pattern is then emitted a SECOND time: the
+    // same notes stacked on themselves, with note-offs landing on the wrong
+    // copies. It sounds like the arp doubling or tripling in speed and smearing
+    // into legato, and it is intermittent because it depends on how the host
+    // happens to jitter.
+    //
+    // A deliberate jump - a loop, a rewind, a locate - is exempt. That is the
+    // one case where going backwards is real, and it has already re-anchored.
+    if (jumped || ! haveRendered)
+        haveRendered = true;
+    else if (blockStartBeat < lastRenderedBeat)
+        blockStartBeat = lastRenderedBeat;
+
+    lastRenderedBeat = blockStartBeat + blockBeats;
+    expectedNextPpq  = lastRenderedBeat;
+    freeBeat         = lastRenderedBeat;
+
+   #if DOMINA_TRACE
+    {
+        double ls = 0.0, le = 0.0;
+        arp.getLoopBounds (ls, le);
+
+        const auto r = std::memory_order_relaxed;
+        stBlockStart.store (blockStartBeat, r);
+        stBlockBeats.store (blockBeats,     r);
+        stBpm       .store (bpm,            r);
+        stLoopStart .store (ls,             r);
+        stLoopEnd   .store (le,             r);
+        stPlayPos   .store ((double) arp.getPlayPosition(), r);
+        stHostPpq   .store (hostPpq,        r);
+        stPlaying   .store (playing ? 1 : 0, r);
+        stSync      .store (sync    ? 1 : 0, r);
+        stSamples   .store (numSamples,      r);
+    }
+   #endif
 
     // ---- MUTE ARP and HOLD --------------------------------------------------
     const bool muteArp = pMuteArp->load() > 0.5f;
@@ -686,7 +913,7 @@ void DominaAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
             if (muteArp)
             {
-                emitNoteOn (at, n, keyVel[n]);
+                emitNoteOn (at, n, keyVel[n], 1);
             }
             else
             {
@@ -700,7 +927,7 @@ void DominaAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             const int n = msg.getNoteNumber();
             keyDown[n] = false;
 
-            if (muteArp) emitNoteOff (at, n);
+            if (muteArp) emitNoteOff (at, n, 1);
             else         arp.noteOff (n);
         }
         else if (msg.isAllNotesOff() || msg.isAllSoundOff())
@@ -708,6 +935,7 @@ void DominaAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             for (int n = 0; n < 128; ++n) keyDown[n] = false;
             arp.reset();
             flushAllPendingOffs (at);
+            silenceBruteForce (at);      // an inbound panic must not be polite
             outMidi.addEvent (msg, at);
         }
         else

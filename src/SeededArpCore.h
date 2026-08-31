@@ -1313,6 +1313,7 @@ public:
         running        = false;
         anchored       = false;
         holdActive     = false;
+        lastProcessed  = -1.0e30;
         origin         = 0.0;
         startBeat      = 0.0;
         chordStartBeat = 0.0;
@@ -1447,6 +1448,10 @@ public:
 
         const double phase = std::max (0.0, double (playPos) - loopStart);
         origin = atBeat - phase;
+
+        // A loop, rewind or locate genuinely moves time backwards, so the
+        // high-water mark moves with it or nothing would ever play again.
+        lastProcessed = atBeat;
     }
 
     // Re-bakes when a bake-relevant parameter changed. Returns true if it did.
@@ -1463,6 +1468,9 @@ public:
 
     const PatternSnapshot& getPattern() const noexcept { return pattern; }
     float getPlayPosition() const noexcept             { return playPos; }
+
+    // Diagnostic accessor: getLoop() is private and this must not change that.
+    void getLoopBounds (double& s, double& e) const noexcept { getLoop (s, e); }
 
     void fillChordSnapshot (ChordSnapshot& cs) const noexcept
     {
@@ -1507,7 +1515,24 @@ public:
         // Nothing plays before the anchor: this covers the chord-gather window
         // and any window that starts earlier than the press (a backward
         // transport jump), which used to wrap round to the END of the pattern.
-        double b = std::max (fromBeat, startBeat);
+        // AND NOTHING PLAYS TWICE. Whenever b gets pinned - by startBeat while
+        // the block window is still catching up to it, or by a caller handing
+        // over an overlapping range - every one of those calls renders from the
+        // SAME position and re-emits the SAME notes. A few milliseconds apart
+        // the instrument downstream stacks them into a comb filter, which is
+        // what "one detuned note" is; pinned for longer it smears into legato.
+        //
+        // The high-water mark makes re-emission impossible whatever pins b.
+        //
+        // BUT IT MUST NEVER BLOCK PLAYBACK. A caller handing back a range well
+        // behind the mark is doing something deliberate - a DAW loop, a rewind,
+        // a locate - and the mark has to yield to it, or the arp falls silent
+        // for good the first time the transport wraps. Only a SMALL overlap is
+        // the re-emission bug, and only that is held back.
+        if (lastProcessed - fromBeat > 0.25)
+            lastProcessed = fromBeat;
+
+        double b = std::max (std::max (fromBeat, startBeat), lastProcessed);
         if (b >= toBeat - 1.0e-9)
             return;
 
@@ -1550,6 +1575,8 @@ public:
         }
 
         playPos = (float) mapToPattern (std::max (startBeat, toBeat - 1.0e-6), loopStart, loopLen);
+
+        lastProcessed = std::max (lastProcessed, toBeat);
     }
 
 private:
@@ -1566,6 +1593,9 @@ private:
     double   startBeat  = 0.0;   // earliest beat this chord may sound
     double   chordStartBeat = 0.0;
     float    playPos    = 0.0f;
+
+    // Furthest beat already turned into events. See process().
+    double   lastProcessed = -1.0e30;
 
     bool     holdActive     = false;   // HOLD: loop just the bar that was playing
     double   holdStartBeats = 0.0;
@@ -1610,13 +1640,21 @@ private:
 
     double mapToPattern (double beat, double loopStart, double loopLen) const noexcept
     {
+        // A NEGATIVE delta WRAPS. It used to clamp to loopStart, and that made a
+        // fixed point: while the beat was behind the anchor - which is exactly
+        // where a DAW loop-back puts it - every block reported pattern position
+        // 0 and re-fired the note sitting there, block after block. Stacked a
+        // few milliseconds apart the instrument downstream comb-filters them,
+        // which is heard as one detuned note at the start of the bar.
+        //
+        // process() already refuses to run before startBeat, so nothing reaches
+        // here early enough for the old clamp to be protecting anything.
         const double delta = beat - origin;
-        if (delta <= 0.0)
-            return loopStart;               // never wrap backwards into the tail
 
         double d = std::fmod (delta, loopLen);
         if (d < 0.0)
-            d = 0.0;
+            d += loopLen;
+
         return loopStart + d;
     }
 
