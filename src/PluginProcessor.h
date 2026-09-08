@@ -36,6 +36,7 @@
 // traceId below is initialised from DominaTrace::nextInstanceId(), so the
 // declaration has to be visible HERE, not only in the .cpp files.
 #include "DebugTrace.h"
+#include "PatchManager.h"
 
 // clap-juce-extensions defines HAS_CLAP_JUCE_EXTENSIONS=1 on every target it is
 // linked into, so this needs no help from CMakeLists and stays 0 automatically
@@ -164,6 +165,22 @@ private:
     // PANIC from the editor. Queued for the audio thread rather than emitted
     // there: MIDI must not be written from the message thread.
     void   requestPanic() noexcept { panicPending.store (true, std::memory_order_relaxed); }
+
+    // ---- patches ------------------------------------------------------------
+    //
+    // ONE serialisation, used by both the project state and the .dompatch file.
+    // If these ever became two functions they would drift, and a patch saved by
+    // one build would load into another with pieces missing.
+    juce::ValueTree captureState();          // not const: copyState() is not
+    void            applyState (const juce::ValueTree& tree);
+
+    bool savePatch (const juce::File& file);
+    bool loadPatch (const juce::File& file);
+
+    // The active patch's name, remembered in the project state so reopening a
+    // song shows what is loaded rather than just its values.
+    juce::String getPatchName() const
+    { return apvts.state.getProperty ("patchName", "Init").toString(); }
    private:
     std::atomic<bool> panicPending { false };
     int    sampleForBeat (double beat, int loSample, int hiSample) const;

@@ -277,14 +277,74 @@ bool DominaAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) c
    #endif
 }
 
+// EVERYTHING that describes a Domina sound, in one tree. The project state and
+// a .dompatch file are both this.
+juce::ValueTree DominaAudioProcessor::captureState()
+{
+    auto state = apvts.copyState();
+    state.setProperty ("midiLearn",  midiLearn.toString(), nullptr);
+    state.setProperty ("dominaVer",  JucePlugin_VersionString, nullptr);
+    return state;
+}
+
+void DominaAudioProcessor::applyState (const juce::ValueTree& tree)
+{
+    if (! tree.isValid() || tree.getType() != apvts.state.getType())
+        return;
+
+    apvts.replaceState (tree);
+    midiLearn.fromString (tree.getProperty ("midiLearn", juce::String()).toString());
+}
+
+bool DominaAudioProcessor::savePatch (const juce::File& file)
+{
+    auto state = captureState();
+    state.setProperty ("patchName", file.getFileNameWithoutExtension(), nullptr);
+
+    // remember it as the active patch, so the project keeps the name too
+    apvts.state.setProperty ("patchName", file.getFileNameWithoutExtension(), nullptr);
+
+    auto inner = state.createXml();
+    if (inner == nullptr)
+        return false;
+
+    juce::XmlElement root (DominaPatch::rootTag());
+    root.setAttribute ("format", 1);
+    root.addChildElement (inner.release());
+
+    return root.writeTo (DominaPatch::withExtension (file));
+}
+
+bool DominaAudioProcessor::loadPatch (const juce::File& file)
+{
+    auto root = juce::XmlDocument::parse (file);
+
+    if (root == nullptr)
+        return false;
+
+    // Accept the wrapper OR a bare state tree, so a patch pulled out of a
+    // project file by hand still loads.
+    auto* inner = root->hasTagName (DominaPatch::rootTag())
+                    ? root->getFirstChildElement()
+                    : root.get();
+
+    if (inner == nullptr)
+        return false;
+
+    const auto tree = juce::ValueTree::fromXml (*inner);
+    if (! tree.isValid())
+        return false;
+
+    applyState (tree);
+    apvts.state.setProperty ("patchName", file.getFileNameWithoutExtension(), nullptr);
+    return true;
+}
+
 void DominaAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     DOMINA_LOG ("#" + juce::String (traceId) + " getStateInformation");
 
-    auto state = apvts.copyState();
-    state.setProperty ("midiLearn", midiLearn.toString(), nullptr);
-
-    if (auto xml = state.createXml())
+    if (auto xml = captureState().createXml())
         copyXmlToBinary (*xml, destData);
 }
 
@@ -296,9 +356,7 @@ void DominaAudioProcessor::setStateInformation (const void* data, int sizeInByte
     if (xml == nullptr || ! xml->hasTagName (apvts.state.getType()))
         return;
 
-    const auto tree = juce::ValueTree::fromXml (*xml);
-    apvts.replaceState (tree);
-    midiLearn.fromString (tree.getProperty ("midiLearn", juce::String()).toString());
+    applyState (juce::ValueTree::fromXml (*xml));
 }
 
 juce::AudioProcessorEditor* DominaAudioProcessor::createEditor()

@@ -110,8 +110,19 @@ so you can see what you are cutting.
 
 Nothing is stored. Nothing is rendered. Six digits rebuild the
 whole thing, exactly, on any computer, years from now. Find a
-phrase you love and write the number on a napkin. That is the
-entire patch.)" },
+phrase you love and write the number on a napkin.
+
+# And when a napkin is not enough
+
+SAVE and LOAD, beside the seed knobs, write the whole state to a
+.dompatch file - every knob, both mute states, the idiom, the
+locators and your MIDI learn assignments. They live in
+Documents/Fanan/Domina/Patches and they are plain XML, so a
+patch can be posted, mailed or read in a text editor.
+
+The name of the loaded patch shows above those buttons and is
+saved into your project, so reopening a song tells you what it
+is playing rather than just playing it.)" },
 
         // ---------------------------------------------------------------- 2
         { "QUICK START", R"(# Four steps

@@ -92,6 +92,64 @@ DominaAudioProcessorEditor::DominaAudioProcessorEditor (DominaAudioProcessor& p)
     };
     addAndMakeVisible (guideButton);
 
+    // ---- patches ------------------------------------------------------------
+    for (auto* b : { &saveButton, &loadButton })
+    {
+        b->setColour (juce::TextButton::buttonColourId,  lnf.keyGrey);
+        b->setColour (juce::TextButton::textColourOffId, lnf.textSecond);
+        addAndMakeVisible (*b);
+    }
+
+    patchLabel.setJustificationType (juce::Justification::centred);
+    patchLabel.setColour (juce::Label::textColourId, lnf.accent);
+    addAndMakeVisible (patchLabel);
+
+    saveButton.onClick = [this]
+    {
+        chooser = std::make_unique<juce::FileChooser> ("Save Domina patch",
+                                                       DominaPatch::folder()
+                                                         .getChildFile (proc.getPatchName()),
+                                                       DominaPatch::wildcard());
+
+        chooser->launchAsync (juce::FileBrowserComponent::saveMode
+                                | juce::FileBrowserComponent::canSelectFiles
+                                | juce::FileBrowserComponent::warnAboutOverwriting,
+                              [this] (const juce::FileChooser& fc)
+        {
+            const auto f = fc.getResult();
+            if (f == juce::File())
+                return;
+
+            proc.savePatch (f);
+            refreshPatchName();
+        });
+    };
+
+    loadButton.onClick = [this]
+    {
+        chooser = std::make_unique<juce::FileChooser> ("Load Domina patch",
+                                                       DominaPatch::folder(),
+                                                       DominaPatch::wildcard());
+
+        chooser->launchAsync (juce::FileBrowserComponent::openMode
+                                | juce::FileBrowserComponent::canSelectFiles,
+                              [this] (const juce::FileChooser& fc)
+        {
+            const auto f = fc.getResult();
+            if (f == juce::File() || ! f.existsAsFile())
+                return;
+
+            if (! proc.loadPatch (f))
+                juce::NativeMessageBox::showMessageBoxAsync (
+                    juce::MessageBoxIconType::WarningIcon, "Domina",
+                    "That file is not a Domina patch:\n" + f.getFullPathName());
+
+            refreshPatchName();
+        });
+    };
+
+    refreshPatchName();
+
     // Accent colour lives in the settings FILE, not in the project and not as a
     // parameter. It belongs to the installation: pick a colour once and every
     // future instance opens that way, in any project, until it is changed
@@ -232,6 +290,8 @@ DominaAudioProcessorEditor::~DominaAudioProcessorEditor()
     muteButton.setLookAndFeel (nullptr);
     muteArpButton.setLookAndFeel (nullptr);
     guideButton.setLookAndFeel (nullptr);
+    saveButton.setLookAndFeel (nullptr);
+    loadButton.setLookAndFeel (nullptr);
     tutorial.reset();                 // the window holds a reference to lnf
     setLookAndFeel (nullptr);
 }
@@ -409,6 +469,14 @@ void DominaAudioProcessorEditor::paintOverChildren (juce::Graphics& g)
     paintLearnBadges (g);
 }
 
+void DominaAudioProcessorEditor::refreshPatchName()
+{
+    const auto n = proc.getPatchName();
+
+    if (patchLabel.getText() != n)
+        patchLabel.setText (n, juce::dontSendNotification);
+}
+
 void DominaAudioProcessorEditor::updateVelRandVisibility()
 {
     const bool on = velRandButton.getToggleState();
@@ -421,6 +489,7 @@ void DominaAudioProcessorEditor::updateVelRandVisibility()
 void DominaAudioProcessorEditor::timerCallback()
 {
     applyPendingMidi();
+    refreshPatchName();      // a project recall changes it behind our back
 
    #if DOMINA_TRACE
     // Drained on the message thread; the audio thread only ever writes into the
@@ -596,11 +665,20 @@ void DominaAudioProcessorEditor::resized()
     // amount, so the seed row stays centred in the window rather than being
     // pushed off-axis by whatever sits beside it.
     {
-        auto ledCol   = seedBand.removeFromLeft  (108);
-        auto guideCol = seedBand.removeFromRight (108);
+        auto ledCol   = seedBand.removeFromLeft  (196);
+        auto patchCol = seedBand.removeFromRight (196);
 
         accentLeds.setBounds (ledCol.withSizeKeepingCentre (96, 16));
-        guideButton.setBounds (guideCol.withSizeKeepingCentre (48, 24));
+
+        // patch name over a row of SAVE / LOAD / GUIDE
+        auto stack = patchCol.withSizeKeepingCentre (188, 48);
+        patchLabel.setBounds (stack.removeFromTop (18));
+        stack.removeFromTop (4);
+
+        const int w = stack.getWidth() / 3;
+        saveButton .setBounds (stack.removeFromLeft (w).reduced (2, 0));
+        loadButton .setBounds (stack.removeFromLeft (w).reduced (2, 0));
+        guideButton.setBounds (stack.reduced (2, 0));
     }
 
     seedDigits.setBounds (seedBand.withSizeKeepingCentre (juce::jmin (kSeedW, seedBand.getWidth() - 16),

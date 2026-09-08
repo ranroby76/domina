@@ -130,8 +130,10 @@ target_compile_definitions(Domina PUBLIC
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
     JUCE_VST3_CAN_REPLACE_VST2=0
-    JUCE_DISPLAY_SPLASH_SCREEN=0
     JUCE_REPORT_APP_USAGE=0)
+
+# JUCE_DISPLAY_SPLASH_SCREEN is deliberately absent: JUCE 9 has no splash screen
+# and warns on every build when the flag is set.
 
 # JUCE_ASIO was here for the Standalone's device manager. A hosted plugin never
 # opens an audio device, so it went with the Standalone.

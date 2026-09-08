@@ -85,6 +85,7 @@ private:
 
     void timerCallback() override;
     void updateVelRandVisibility();
+    void refreshPatchName();
 
     DominaAudioProcessor& proc;
     DominaLookAndFeel     lnf;
@@ -123,6 +124,10 @@ private:
     VirtualKeyboard  keyboard { proc.keyboardState, lnf };
     juce::TextButton holdButton  { "HOLD" };
     juce::TextButton guideButton { "GUIDE" };
+    juce::TextButton saveButton  { "SAVE" };
+    juce::TextButton loadButton  { "LOAD" };
+    juce::Label      patchLabel;
+    std::unique_ptr<juce::FileChooser> chooser;   // must outlive launchAsync
     AccentLedStrip   accentLeds { lnf };
     std::unique_ptr<TutorialWindow> tutorial;
     juce::TextButton panicButton { "PANIC" };
