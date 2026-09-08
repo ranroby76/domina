@@ -79,17 +79,9 @@ DominaAudioProcessorEditor::DominaAudioProcessorEditor (DominaAudioProcessor& p)
     // GUIDE sits at the right edge of the seed band, hard against the border.
     guideButton.setColour (juce::TextButton::buttonColourId,  lnf.keyGrey);
     guideButton.setColour (juce::TextButton::textColourOffId, lnf.textSecond);
-    guideButton.onClick = [this]
-    {
-        if (tutorial != nullptr)
-        {
-            tutorial->toFront (true);
-            return;
-        }
+    guideButton.onClick = [this] { tutorial.setVisible (true); };
 
-        tutorial = std::make_unique<TutorialWindow> (lnf);
-        tutorial->onClose = [this] { tutorial.reset(); };
-    };
+    addChildComponent (tutorial);      // a child of the editor, not a window
     addAndMakeVisible (guideButton);
 
     // ---- patches ------------------------------------------------------------
@@ -114,8 +106,14 @@ DominaAudioProcessorEditor::DominaAudioProcessorEditor (DominaAudioProcessor& p)
         chooser->launchAsync (juce::FileBrowserComponent::saveMode
                                 | juce::FileBrowserComponent::canSelectFiles
                                 | juce::FileBrowserComponent::warnAboutOverwriting,
-                              [this] (const juce::FileChooser& fc)
+                              [this, safe = juce::Component::SafePointer<juce::Component> (this)]
+                              (const juce::FileChooser& fc)
         {
+            // The sheet outlives the window on macOS: if the plugin was closed
+            // while it was open, this callback would touch a dead editor.
+            if (safe == nullptr)
+                return;
+
             const auto f = fc.getResult();
             if (f == juce::File())
                 return;
@@ -133,8 +131,12 @@ DominaAudioProcessorEditor::DominaAudioProcessorEditor (DominaAudioProcessor& p)
 
         chooser->launchAsync (juce::FileBrowserComponent::openMode
                                 | juce::FileBrowserComponent::canSelectFiles,
-                              [this] (const juce::FileChooser& fc)
+                              [this, safe = juce::Component::SafePointer<juce::Component> (this)]
+                              (const juce::FileChooser& fc)
         {
+            if (safe == nullptr)
+                return;
+
             const auto f = fc.getResult();
             if (f == juce::File() || ! f.existsAsFile())
                 return;
@@ -161,8 +163,6 @@ DominaAudioProcessorEditor::DominaAudioProcessorEditor (DominaAudioProcessor& p)
     {
         DominaSettings::setAccent (i);   // written through at once
         repaint();                       // children read lnf.accent live
-        if (tutorial != nullptr)
-            tutorial->repaint();
     };
     addAndMakeVisible (accentLeds);
 
@@ -292,7 +292,6 @@ DominaAudioProcessorEditor::~DominaAudioProcessorEditor()
     guideButton.setLookAndFeel (nullptr);
     saveButton.setLookAndFeel (nullptr);
     loadButton.setLookAndFeel (nullptr);
-    tutorial.reset();                 // the window holds a reference to lnf
     setLookAndFeel (nullptr);
 }
 
@@ -631,6 +630,8 @@ void DominaAudioProcessorEditor::layoutControlRow (juce::Rectangle<int> row, juc
 
 void DominaAudioProcessorEditor::resized()
 {
+    tutorial.setBounds (getLocalBounds());     // covers everything when shown
+
     auto r = getLocalBounds().reduced (kMargin);
 
     // ---- title row -----------------------------------------------------------

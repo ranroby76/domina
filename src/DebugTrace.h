@@ -61,6 +61,16 @@ namespace DominaTrace
                         + what + juce::newLine);
     }
 
+    // NEVER ON BY DEFAULT, not even with the trace on.
+    //
+    // setApplicationCrashHandler installs PROCESS-WIDE signal handlers that
+    // point into this binary. When the host unloads the plugin - which happens
+    // every time a user removes it from a track - those pointers dangle, and
+    // the next signal anywhere in the process takes the DAW down with it. A
+    // diagnostic must not be able to do that to somebody's session.
+    //
+    // Build with -DDOMINA_CRASH_HANDLER=1 for a debugging session on your own
+    // machine, never for anything that leaves it.
     inline void installCrashHandler()
     {
         static bool done = false;          // plain bool: no destructor to run at unload
@@ -69,6 +79,7 @@ namespace DominaTrace
 
         done = true;
 
+       #if defined (DOMINA_CRASH_HANDLER) && DOMINA_CRASH_HANDLER
         juce::SystemStats::setApplicationCrashHandler ([] (void*)
         {
             const auto f = traceFile();
@@ -76,6 +87,7 @@ namespace DominaTrace
             f.appendText (juce::newLine + "*** CRASH ***" + juce::newLine
                             + juce::SystemStats::getStackBacktrace() + juce::newLine);
         });
+       #endif
 
         log (juce::String ("--- trace started, Domina ") + JucePlugin_VersionString
                + ", note trace ACTIVE, built " __DATE__ " " __TIME__ " ---");

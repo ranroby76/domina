@@ -129,7 +129,7 @@ private:
     juce::Label      patchLabel;
     std::unique_ptr<juce::FileChooser> chooser;   // must outlive launchAsync
     AccentLedStrip   accentLeds { lnf };
-    std::unique_ptr<TutorialWindow> tutorial;
+    TutorialOverlay  tutorial { lnf };
     juce::TextButton panicButton { "PANIC" };
 
     CcMonitorChip ccChip { proc.midiLearn, lnf };

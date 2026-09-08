@@ -106,6 +106,40 @@ jobs:
           if ! lipo -info "$BIN" | grep -q arm64;  then echo "::error::no arm64 slice";  exit 1; fi
           if ! lipo -info "$BIN" | grep -q x86_64; then echo "::error::no x86_64 slice"; exit 1; fi
 
+      # ------------------------------------------------------------------
+      # VALIDATE THE AU, which is the format Logic loads and the one that has
+      # never been tested by anything. Logic runs the same checks itself on
+      # first use; running them here means a broken AU fails the build instead
+      # of a customer's session.
+      #
+      # aumu = music device, from IS_SYNTH TRUE. Domn = PLUGIN_CODE.
+      # Fnan = PLUGIN_MANUFACTURER_CODE.
+      # ------------------------------------------------------------------
+      - name: Validate the AU
+        run: |
+          A="build/${PRODUCT}_artefacts/Release"
+          mkdir -p ~/Library/Audio/Plug-Ins/Components
+          rm -rf  ~/Library/Audio/Plug-Ins/Components/${PRODUCT}.component
+          cp -R "$A/AU/${PRODUCT}.component" ~/Library/Audio/Plug-Ins/Components/
+          killall -9 AudioComponentRegistrar 2>/dev/null || true
+          sleep 2
+          auval -v aumu Domn Fnan
+
+      # The runner is arm64, so the x86_64 slice is CROSS-COMPILED and nothing
+      # has ever executed it - and Intel Macs are exactly where it ships. This
+      # runs it under Rosetta when that is available. Non-fatal, because Rosetta
+      # is not guaranteed on a runner, but a failure HERE is a real finding.
+      - name: Validate the AU as Intel (best effort)
+        continue-on-error: true
+        run: |
+          if /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null; then
+            killall -9 AudioComponentRegistrar 2>/dev/null || true
+            sleep 2
+            /usr/bin/arch -x86_64 auval -v aumu Domn Fnan
+          else
+            echo "::warning::Rosetta not available - the x86_64 slice is shipping untested"
+          fi
+
       - name: Sign
         if: env.SIGNING_ENABLED != ''
         run: |

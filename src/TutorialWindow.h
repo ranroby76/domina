@@ -683,32 +683,66 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// The window
+// The overlay
+//
+// A CHILD OF THE EDITOR, not a desktop window. A plugin that opens a real
+// window has to create and tear down a native window from inside its editor's
+// lifetime, and on macOS that is a reliable way to crash a host - the more so
+// when the editor is closed while the window is still open.
+//
+// It is also better behaved: it cannot end up hidden behind the DAW, it moves
+// with the plugin, and it closes when the plugin does because it IS the plugin.
 // ---------------------------------------------------------------------------
-class TutorialWindow : public juce::DocumentWindow
+class TutorialOverlay : public juce::Component
 {
 public:
-    explicit TutorialWindow (DominaLookAndFeel& l)
-        : juce::DocumentWindow ("Domina - Guide", l.windowBg,
-                                juce::DocumentWindow::closeButton)
+    explicit TutorialOverlay (DominaLookAndFeel& l) : lnf (l), body (l)
     {
-        setUsingNativeTitleBar (true);
-        setContentOwned (new TutorialComponent (l), false);
-        setResizable (true, false);
-        setResizeLimits (560, 420, 1400, 1000);
-        centreWithSize (720, 560);
-        setVisible (true);
+        addAndMakeVisible (body);
+
+        closeButton.setColour (juce::TextButton::buttonColourId,  lnf.keyGrey);
+        closeButton.setColour (juce::TextButton::textColourOffId, lnf.textPrimary);
+        closeButton.onClick = [this] { setVisible (false); };
+        addAndMakeVisible (closeButton);
+
+        setInterceptsMouseClicks (true, true);   // swallow clicks on the panel behind
     }
 
-    // The editor owns this and clears its pointer, so the window must not try
-    // to delete itself when the close button is pressed.
-    std::function<void()> onClose;
-
-    void closeButtonPressed() override
+    void paint (juce::Graphics& g) override
     {
-        if (onClose)
-            onClose();
+        g.fillAll (juce::Colours::black.withAlpha (0.72f));
+
+        g.setColour (lnf.windowBg);
+        g.fillRoundedRectangle (panel().toFloat(), 6.0f);
+
+        g.setColour (lnf.accent.withAlpha (0.5f));
+        g.drawRoundedRectangle (panel().toFloat(), 6.0f, 1.0f);
     }
 
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TutorialWindow)
+    void resized() override
+    {
+        auto r = panel().reduced (10);
+        closeButton.setBounds (r.removeFromTop (24).removeFromRight (78));
+        r.removeFromTop (6);
+        body.setBounds (r);
+    }
+
+    void visibilityChanged() override
+    {
+        if (isVisible())
+            toFront (true);
+    }
+
+private:
+    juce::Rectangle<int> panel() const
+    {
+        return getLocalBounds().reduced (juce::jmax (12, getWidth()  / 10),
+                                         juce::jmax (12, getHeight() / 14));
+    }
+
+    DominaLookAndFeel& lnf;
+    TutorialComponent  body;
+    juce::TextButton   closeButton { "CLOSE" };
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TutorialOverlay)
 };

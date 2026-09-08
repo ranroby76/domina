@@ -405,6 +405,8 @@ int DominaAudioProcessor::sampleForBeat (double beat, int loSample, int hiSample
 // nothing upstream has to know about them.
 void DominaAudioProcessor::emitNoteOn (int sample, int note, float velocity, int src)
 {
+    juce::ignoreUnused (src);   // only read when DOMINA_TRACE is on
+
     if (pMute->load() > 0.5f)
         return;
 
@@ -448,6 +450,8 @@ void DominaAudioProcessor::emitNoteOn (int sample, int note, float velocity, int
 // whatever instrument is downstream.
 void DominaAudioProcessor::emitNoteOff (int sample, int note, int src)
 {
+    juce::ignoreUnused (src);   // only read when DOMINA_TRACE is on
+
     const int ch = juce::jlimit (1, 16, (int) pOutChannel->load());
     outMidi.addEvent (juce::MidiMessage::noteOff (ch, note), sample);
     outSounding[juce::jlimit (0, 127, note)] = false;
